@@ -74,7 +74,6 @@ namespace SinglesSlinger
         }
 
         // Optional debug logging gate.
-        // If you do not have Plugin.DebugLogging, this safely behaves as "off".
         private static bool DebugEnabled
         {
             get
@@ -88,7 +87,6 @@ namespace SinglesSlinger
                     var v = f.GetValue(null);
                     if (v == null) return false;
 
-                    // ConfigEntry<bool> has Value property
                     var p = AccessTools.Property(v.GetType(), "Value");
                     if (p == null) return false;
 
@@ -108,7 +106,6 @@ namespace SinglesSlinger
 
             try
             {
-                // Use Info so you can see it without enabling BepInEx debug level
                 Plugin.Log.LogInfo(msg);
             }
             catch
@@ -124,7 +121,6 @@ namespace SinglesSlinger
 
                 var t = shelf.GetType();
 
-                // Fields first, AccessTools.Field does not spam warnings when missing
                 var field =
                     AccessTools.Field(t, "m_ObjectType") ??
                     AccessTools.Field(t, "objectType") ??
@@ -137,7 +133,6 @@ namespace SinglesSlinger
                     if (val != null && val.ToString() == "VintageCardTable") return true;
                 }
 
-                // Properties next, but use silent reflection, NOT AccessTools.Property
                 const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 
                 PropertyInfo prop =
@@ -152,7 +147,6 @@ namespace SinglesSlinger
                     if (val != null && val.ToString() == "VintageCardTable") return true;
                 }
 
-                // Last resort, check Unity object name if present, also silent reflection
                 PropertyInfo nameProp = t.GetProperty("name", flags);
                 if (nameProp != null)
                 {
@@ -166,6 +160,70 @@ namespace SinglesSlinger
             }
 
             return false;
+        }
+
+        // ---------------------------------------------------------------
+        // Grading Overhaul mod compatibility
+        // Decodes the new encoded cardGrade integer introduced by the
+        // TCGCardShopSimulator.GradingOverhaul mod.
+        //
+        // Encoding scheme (from Helper.cs in the overhaul mod):
+        //   Cardinals vanilla : 1-10  (raw, no encoding)
+        //   Cardinals with cert: 0-199,999,999 range
+        //   PSA               : 200,000,000 base
+        //   Beckett           : 300,000,000 base
+        //   Cheat flag        : + 1,000,000,000
+        //
+        // Each company encodes as:  base + (gradeSlot * 10,000,000) + cert
+        // ---------------------------------------------------------------
+        private static void DecodeCardGrade(int cardGrade, out int grade, out string company)
+        {
+            int num = cardGrade;
+
+            // Strip cheat flag if present
+            if (num >= 1000000000)
+                num = num - 1000000000;
+
+            // Vanilla Cardinals (simple 1-10, no cert)
+            if (num >= 1 && num <= 10)
+            {
+                company = "Cardinals";
+                grade = num;
+                return;
+            }
+
+            // Beckett (300,000,000 base) - check before PSA since it is the higher base
+            if (num >= 300000000)
+            {
+                company = "Beckett";
+                int relative = num - 300000000;
+                int slot = relative / 10000000;
+                grade = SlotToGrade(slot);
+                return;
+            }
+
+            // PSA (200,000,000 base)
+            if (num >= 200000000)
+            {
+                company = "PSA";
+                int relative = num - 200000000;
+                int slot = relative / 10000000;
+                grade = SlotToGrade(slot);
+                return;
+            }
+
+            // Cardinals with cert (new style, same base but has cert encoded)
+            company = "Cardinals";
+            int slot2 = num / 10000000;
+            grade = SlotToGrade(slot2);
+        }
+
+        private static int SlotToGrade(int slot)
+        {
+            // slot 0=grade1, 1=grade2 ... 9=grade10
+            int[] slotToGrade = new int[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+            if (slot < 0 || slot >= slotToGrade.Length) return 1;
+            return slotToGrade[slot];
         }
 
         private static List<CardData> GetCompatibleCards(ECardExpansionType expansionType, bool findGhostDimensionCards = false)
@@ -294,19 +352,15 @@ namespace SinglesSlinger
 
                 try
                 {
-                    // Add all enabled expansions (non ghost dimension)
                     foreach (var kvp in Plugin.EnabledExpansions)
                     {
                         if (!kvp.Value.Value)
                             continue;
 
                         ECardExpansionType expansion = kvp.Key;
-
-                        // Standard cards for that expansion
                         all.AddRange(GetCompatibleCards(expansion, false));
                     }
 
-                    // If Ghost expansion is enabled, also include ghost dimension cards
                     if (Plugin.EnabledExpansions.TryGetValue(ECardExpansionType.Ghost, out var ghostEnabled) && ghostEnabled.Value)
                     {
                         all.AddRange(GetCompatibleCards(ECardExpansionType.Ghost, true));
@@ -325,7 +379,6 @@ namespace SinglesSlinger
                         }
                         else
                         {
-                            // Random mode: do not keep the list price sorted
                             ShuffleInPlace(all);
                             LogDebug("[SinglesSlinger] Random placement mode. Shuffled matching card list.");
                         }
@@ -385,6 +438,19 @@ namespace SinglesSlinger
 
                         if (cd.cardGrade <= 0)
                             continue;
+
+                        // Decode the grade to get the actual grade number and company name.
+                        // This handles vanilla Cardinals (1-10) as well as the new PSA and
+                        // Beckett encoded grades introduced by the GradingOverhaul mod.
+                        DecodeCardGrade(cd.cardGrade, out int actualGrade, out string gradingCompany);
+
+                        if (actualGrade <= 0)
+                            continue;
+
+                        // Filter by grading company using config toggles
+                        if (gradingCompany == "PSA" && !Plugin.GradedAllowPSA.Value) continue;
+                        if (gradingCompany == "Beckett" && !Plugin.GradedAllowBeckett.Value) continue;
+                        if (gradingCompany == "Cardinals" && !Plugin.GradedAllowCardinals.Value) continue;
 
                         if (!Plugin.EnabledExpansions.TryGetValue(cd.expansionType, out var enabled) || !enabled.Value)
                             continue;
@@ -775,11 +841,16 @@ namespace SinglesSlinger
         [HarmonyPostfix]
         private static void OnCustomerTakeCardFromShelfPostFix(Customer __instance, InteractableCardCompartment ___m_CurrentCardCompartment)
         {
-            if (!Plugin.TriggerOnCustomerCardPickup.Value) return;
             if (___m_CurrentCardCompartment == null) return;
 
             if (___m_CurrentCardCompartment.m_StoredCardList.Count < 1)
-                DoShelfPut(RunMode.NormalSingles);
+            {
+                if (Plugin.TriggerOnCustomerCardPickup.Value)
+                    DoShelfPut(RunMode.NormalSingles);
+
+                if (Plugin.GradedTriggerOnCustomerCardPickup.Value)
+                    DoShelfPut(RunMode.GradedCards);
+            }
         }
 
         [HarmonyPatch(typeof(PriceChangeManager), "OnDayStarted")]
@@ -788,6 +859,9 @@ namespace SinglesSlinger
         {
             if (Plugin.TriggerOnDayStart.Value)
                 DoShelfPut(RunMode.NormalSingles);
+
+            if (Plugin.GradedTriggerOnDayStart.Value)
+                DoShelfPut(RunMode.GradedCards);
         }
 
         [HarmonyPatch(typeof(CGameManager), "Update")]
