@@ -12,9 +12,13 @@ namespace SinglesSlinger
     /// SCAN (gather eligible cards) → ASSIGN (map cards to compartments) →
     /// SPAWN (create 3D objects in batches). Supports both ungraded and graded cards.
     ///
-    /// Event-driven triggers (customer pickup) use a debounce pattern: rapid
-    /// events are collapsed into a single pipeline run after activity settles.
-    /// Hotkeys and day-start triggers execute immediately.
+    /// Event-driven triggers (customer pickup) use a two-tier strategy:
+    /// 1. If a card cache exists from a prior full pipeline run, performs a fast
+    ///    synchronous refill targeting only the emptied compartment(s) — typically
+    ///    completes in under 1 ms.
+    /// 2. Otherwise, falls back to a full debounced pipeline run.
+    ///
+    /// Hotkeys and day-start triggers always execute the full pipeline immediately.
     /// </summary>
     internal static class ShelfPlacer
     {
@@ -34,18 +38,39 @@ namespace SinglesSlinger
         private static float _normalRequestTime;
         private static float _gradedRequestTime;
 
+        // ── Card cache for quick event-driven refills ──────────────────
+        // Populated during the full pipeline SCAN phase. Contains all eligible
+        // CardData objects that passed filters at scan time. The quick refill
+        // path verifies live inventory counts before placing, so stale entries
+        // are harmlessly skipped and lazily pruned.
+        private static readonly List<CardData> _normalCardCache = new List<CardData>();
+
+        // ── Tracked empty compartments from customer pickups ───────────
+        private static readonly List<InteractableCardCompartment> _pendingNormalCompartments
+            = new List<InteractableCardCompartment>();
+        private static readonly List<InteractableCardCompartment> _pendingGradedCompartments
+            = new List<InteractableCardCompartment>();
+
         /// <summary>
-        /// Marks that a refill is needed for the given mode. The actual pipeline
-        /// will not start until the debounce delay elapses with no new requests.
-        /// Each call resets the debounce timer so that bursts of rapid events
-        /// collapse into one pipeline run.
+        /// Marks that a refill is needed for the given mode. For event-driven
+        /// triggers (customer pickup), also tracks the emptied compartment so
+        /// the quick refill can target it directly. Each call resets the
+        /// debounce timer so rapid pickups collapse into one operation.
         /// </summary>
-        internal static void RequestRefill(RunMode mode)
+        internal static void RequestRefill(
+            RunMode mode,
+            InteractableCardCompartment emptiedCompartment = null)
         {
             float now = Time.realtimeSinceStartup;
 
             if (mode == RunMode.NormalSingles)
             {
+                if (emptiedCompartment != null &&
+                    !_pendingNormalCompartments.Contains(emptiedCompartment))
+                {
+                    _pendingNormalCompartments.Add(emptiedCompartment);
+                }
+
                 _normalRefillRequested = true;
                 _normalRequestTime = now;
                 LogHelper.LogDebug(
@@ -53,6 +78,12 @@ namespace SinglesSlinger
             }
             else
             {
+                if (emptiedCompartment != null &&
+                    !_pendingGradedCompartments.Contains(emptiedCompartment))
+                {
+                    _pendingGradedCompartments.Add(emptiedCompartment);
+                }
+
                 _gradedRefillRequested = true;
                 _gradedRequestTime = now;
                 LogHelper.LogDebug(
@@ -62,8 +93,11 @@ namespace SinglesSlinger
 
         /// <summary>
         /// Called every frame from the Update patch. Checks whether any debounced
-        /// refill requests have settled and starts the pipeline if so.
-        /// Cost: two boolean checks + two float comparisons — nanoseconds.
+        /// refill requests have settled. For normal cards, uses the quick refill
+        /// path when a card cache is available and compartments are pending;
+        /// otherwise falls back to the full pipeline. Graded cards always use
+        /// the full pipeline.
+        /// Cost when idle: two boolean checks + two float comparisons.
         /// </summary>
         internal static void ProcessPendingRefills()
         {
@@ -76,30 +110,47 @@ namespace SinglesSlinger
                 (now - _normalRequestTime) >= delay)
             {
                 _normalRefillRequested = false;
-                LogHelper.LogDebug(
-                    "[SinglesSlinger] Normal debounce elapsed — starting pipeline.");
-                DoShelfPut(RunMode.NormalSingles);
+
+                if (_normalCardCache.Count > 0 &&
+                    _pendingNormalCompartments.Count > 0)
+                {
+                    LogHelper.LogDebug(
+                        "[SinglesSlinger] Normal debounce elapsed — quick refill " +
+                        "from cache (" + _normalCardCache.Count + " cached, " +
+                        _pendingNormalCompartments.Count + " pending).");
+                    RunQuickNormalRefill();
+                }
+                else
+                {
+                    LogHelper.LogDebug(
+                        "[SinglesSlinger] Normal debounce elapsed — cache empty " +
+                        "or no pending compartments, starting full pipeline.");
+                    _pendingNormalCompartments.Clear();
+                    DoShelfPut(RunMode.NormalSingles);
+                }
             }
 
             if (_gradedRefillRequested && !isRunningGraded &&
                 (now - _gradedRequestTime) >= delay)
             {
                 _gradedRefillRequested = false;
+                _pendingGradedCompartments.Clear();
                 LogHelper.LogDebug(
-                    "[SinglesSlinger] Graded debounce elapsed — starting pipeline.");
+                    "[SinglesSlinger] Graded debounce elapsed — starting full pipeline.");
                 DoShelfPut(RunMode.GradedCards);
             }
         }
 
         /// <summary>
-        /// Immediately starts the placement pipeline for the given mode.
-        /// Clears any pending debounce request for the same mode.
+        /// Immediately starts the full placement pipeline for the given mode.
+        /// Clears any pending debounce request and pending compartments.
         /// </summary>
         internal static void DoShelfPut(RunMode mode)
         {
             if (mode == RunMode.NormalSingles)
             {
                 _normalRefillRequested = false;
+                _pendingNormalCompartments.Clear();
 
                 if (isRunningNormal) return;
                 isRunningNormal = true;
@@ -117,6 +168,7 @@ namespace SinglesSlinger
             else
             {
                 _gradedRefillRequested = false;
+                _pendingGradedCompartments.Clear();
 
                 if (isRunningGraded) return;
                 isRunningGraded = true;
@@ -134,11 +186,222 @@ namespace SinglesSlinger
         }
 
         // ═══════════════════════════════════════════════════════════════
+        //  Quick synchronous refill for normal cards
+        // ═══════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Fast synchronous refill that places cards from the cached eligible
+        /// card list into specifically-tracked emptied compartments. Performs
+        /// no inventory scanning, no shelf iteration, and no coroutine
+        /// overhead. Typically completes in well under 1 ms for 1–5 slots.
+        /// Does NOT invalidate the BinderOverhaul cache.
+        /// </summary>
+        private static void RunQuickNormalRefill()
+        {
+            int keepQty = Plugin.KeepCardQty.Value;
+            bool mostExpensive = Plugin.OnlyPlaceMostExpensive.Value;
+            int placed = 0;
+
+            // ── Validate pending compartments ──────────────────────────
+            for (int i = _pendingNormalCompartments.Count - 1; i >= 0; i--)
+            {
+                InteractableCardCompartment cc = _pendingNormalCompartments[i];
+
+                bool invalid = false;
+
+                if (cc == null)
+                {
+                    invalid = true;
+                }
+                else if (cc.m_StoredCardList == null ||
+                         cc.m_StoredCardList.Count > 0)
+                {
+                    invalid = true;
+                }
+                else if (cc.m_ItemNotForSale)
+                {
+                    invalid = true;
+                }
+
+                if (!invalid && Plugin.SkipVintageTables.Value)
+                {
+                    try
+                    {
+                        CardShelf shelf = cc.GetCardShelf();
+                        if (shelf != null && ShelfUtility.IsVintageTable(shelf))
+                            invalid = true;
+                    }
+                    catch
+                    {
+                        invalid = true;
+                    }
+                }
+
+                if (invalid)
+                    _pendingNormalCompartments.RemoveAt(i);
+            }
+
+            if (_pendingNormalCompartments.Count == 0)
+            {
+                LogHelper.LogDebug(
+                    "[SinglesSlinger] Quick refill: no valid pending compartments.");
+                return;
+            }
+
+            // ── Place cards from cache ─────────────────────────────────
+            for (int ci = 0; ci < _pendingNormalCompartments.Count; ci++)
+            {
+                if (_normalCardCache.Count == 0)
+                    break;
+
+                InteractableCardCompartment cc = _pendingNormalCompartments[ci];
+                if (cc == null ||
+                    cc.m_StoredCardList == null ||
+                    cc.m_StoredCardList.Count > 0)
+                {
+                    continue;
+                }
+
+                CardData cardData = null;
+                int selectedIdx = -1;
+
+                if (mostExpensive)
+                {
+                    // Cache is sorted most-expensive-first; pick from front
+                    for (int j = 0; j < _normalCardCache.Count; j++)
+                    {
+                        CardData candidate = _normalCardCache[j];
+                        if (candidate == null ||
+                            candidate.monsterType == EMonsterType.None)
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            int owned = CPlayerData.GetCardAmount(candidate);
+                            if (owned > keepQty)
+                            {
+                                cardData = candidate;
+                                selectedIdx = j;
+                                break;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                else
+                {
+                    // Random start, sequential scan (wraps around) to
+                    // guarantee finding a card if any eligible one exists.
+                    if (_normalCardCache.Count > 0)
+                    {
+                        int startIdx =
+                            CardCollector.Rng.Next(_normalCardCache.Count);
+
+                        for (int scan = 0;
+                             scan < _normalCardCache.Count;
+                             scan++)
+                        {
+                            int idx =
+                                (startIdx + scan) % _normalCardCache.Count;
+                            CardData candidate = _normalCardCache[idx];
+
+                            if (candidate == null ||
+                                candidate.monsterType == EMonsterType.None)
+                            {
+                                continue;
+                            }
+
+                            try
+                            {
+                                int owned =
+                                    CPlayerData.GetCardAmount(candidate);
+                                if (owned > keepQty)
+                                {
+                                    cardData = candidate;
+                                    selectedIdx = idx;
+                                    break;
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+
+                if (cardData == null)
+                    break;
+
+                try
+                {
+                    CPlayerData.ReduceCard(cardData, 1);
+                    ShelfUtility.PlaceCardDirect(cc, cardData);
+                    placed++;
+
+                    // Update cache depending on mode
+                    if (mostExpensive)
+                    {
+                        // Prevent duplicate types across compartments
+                        if (selectedIdx >= 0 &&
+                            selectedIdx < _normalCardCache.Count)
+                        {
+                            _normalCardCache.RemoveAt(selectedIdx);
+                        }
+                    }
+                    else
+                    {
+                        // Only remove when card type is fully exhausted
+                        try
+                        {
+                            int remaining =
+                                CPlayerData.GetCardAmount(cardData);
+                            if (remaining <= keepQty &&
+                                selectedIdx >= 0 &&
+                                selectedIdx < _normalCardCache.Count)
+                            {
+                                CardCollector.SwapRemoveAt(
+                                    _normalCardCache, selectedIdx);
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (Plugin.TryTriggerPriceSlinger.Value)
+                        ShelfUtility.TryTellPriceSlinger(cc);
+                }
+                catch (Exception ex)
+                {
+                    try { CPlayerData.AddCard(cardData, 1); } catch { }
+                    LogHelper.LogErrorThrottled("QuickRefill",
+                        "[SinglesSlinger] Quick refill placement failed: " +
+                        ex, 5f);
+                }
+            }
+
+            _pendingNormalCompartments.Clear();
+
+            if (placed > 0)
+            {
+                LogHelper.LogDebug(
+                    "[SinglesSlinger] Quick refill placed " + placed +
+                    " card(s).");
+                ShelfUtility.ShowPopup(
+                    placed + " card(s) placed (quick refill).");
+            }
+            else
+            {
+                LogHelper.LogDebug(
+                    "[SinglesSlinger] Quick refill: no eligible cards in cache.");
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
         //  Normal (ungraded) singles pipeline
         // ═══════════════════════════════════════════════════════════════
         private static IEnumerator RunNormalPipeline()
         {
-            int batchSize = Plugin.CardBatchSize != null ? Plugin.CardBatchSize.Value : 20;
+            int batchSize = Plugin.CardBatchSize != null
+                ? Plugin.CardBatchSize.Value : 20;
 
             // ── PHASE 1: SCAN ──────────────────────────────────────────
             var allCards = new List<CardData>();
@@ -151,14 +414,16 @@ namespace SinglesSlinger
                 catch (Exception ex)
                 {
                     Plugin.Log.LogError(
-                        "[SinglesSlinger] Bridge GetCompatibleCards failed:\r\n" + ex);
+                        "[SinglesSlinger] Bridge GetCompatibleCards failed:\r\n" +
+                        ex);
                 }
 
                 if (bridgeResult != null)
                 {
                     allCards = bridgeResult;
                     usedBridge = true;
-                    LogHelper.LogDebug("[SinglesSlinger] (BinderOverhaul) Got " +
+                    LogHelper.LogDebug(
+                        "[SinglesSlinger] (BinderOverhaul) Got " +
                         allCards.Count + " cards from bridge.");
                 }
             }
@@ -188,6 +453,7 @@ namespace SinglesSlinger
             if (allCards.Count == 0)
             {
                 isRunningNormal = false;
+                _normalCardCache.Clear();
                 ShelfUtility.ShowPopup(
                     "SinglesSlinger: No cards matching configured filters!");
                 yield break;
@@ -207,6 +473,17 @@ namespace SinglesSlinger
 
             yield return null;
 
+            // ── Populate card cache for future quick refills ────────────
+            _normalCardCache.Clear();
+            for (int ci = 0; ci < allCards.Count; ci++)
+            {
+                _normalCardCache.Add(allCards[ci]);
+            }
+
+            LogHelper.LogDebug(
+                "[SinglesSlinger] Card cache populated with " +
+                _normalCardCache.Count + " eligible cards.");
+
             // Count total placeable copies
             int totalPlaceable = 0;
             int keepQty = Plugin.KeepCardQty.Value;
@@ -215,7 +492,8 @@ namespace SinglesSlinger
                 try
                 {
                     int owned = CPlayerData.GetCardAmount(allCards[c]);
-                    if (owned > keepQty) totalPlaceable += (owned - keepQty);
+                    if (owned > keepQty)
+                        totalPlaceable += (owned - keepQty);
                 }
                 catch { }
 
